@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Patient-derived whole-slide images — not committed (size + blinding/privacy, see SPEC.md §2)
+slides/*.svs
+slides/*.ndpi
+slides/*.tiff
+slides/*.tif
