@@ -97,6 +97,7 @@ def create_viewer_ui():
         "is_painting": False,
         "paint_value": None,
         "last_painted_tile": None,
+        "syncing_pan_sliders": False,
     }
 
     # ── File chooser (a WSI file to start fresh, or a previously exported
@@ -129,12 +130,43 @@ def create_viewer_ui():
     # ── Thumbnail (clickable/draggable navigator) ──
     thumb_widget = widgets.Image(
         format="png",
-        layout=widgets.Layout(border="1px solid #ccc", cursor="crosshair"),
+        layout=widgets.Layout(border="1px solid #ccc", cursor="crosshair", margin="0px"),
     )
     thumb_label = widgets.HTML(
-        value="<i style='color:gray; font-size:12px;'>Click or drag on the thumbnail to navigate</i>"
+        value=(
+            "<i style='color:gray; font-size:12px;'>Click or drag on the thumbnail, "
+            "or use the sliders, to navigate</i>"
+        )
     )
-    thumb_column = widgets.VBox([thumb_widget, thumb_label])
+
+    # Pan sliders alongside the thumbnail -- an alternative to click/drag for
+    # precise navigation. Range/size are set to match the slide/thumbnail
+    # once a slide is loaded (see _commit_slide). Vertical slider value
+    # increases upward (ipywidgets convention for vertical orientation), so
+    # it's inverted against center_y (which increases downward) when read.
+    horizontal_pan_slider = widgets.IntSlider(
+        value=0, min=0, max=1, step=1, readout=False,
+        layout=widgets.Layout(width="300px", margin="0px"),
+    )
+    vertical_pan_slider = widgets.IntSlider(
+        value=0, min=0, max=1, step=1, readout=False, orientation="vertical",
+        # ipywidgets' Layout has no "gap" property for HBox/VBox -- spacing
+        # between children comes from their own margins, so the small
+        # right-margin here is the actual gap to the thumbnail.
+        layout=widgets.Layout(height="300px", width="20px", margin="0px 4px 0px 0px"),
+    )
+    # Horizontal slider stacks directly under the thumbnail (not the vertical
+    # slider too), and the vertical slider top-aligns with the thumbnail
+    # image itself so its height ends where the horizontal slider begins.
+    thumb_and_hslider = widgets.VBox(
+        [thumb_widget, horizontal_pan_slider],
+        layout=widgets.Layout(align_items="center", margin="0px"),
+    )
+    thumb_row = widgets.HBox(
+        [vertical_pan_slider, thumb_and_hslider],
+        layout=widgets.Layout(align_items="flex-start", margin="0px"),
+    )
+    thumb_column = widgets.VBox([thumb_row, thumb_label])
 
     # ── Viewport (square) ──
     view_widget = widgets.Image(
@@ -155,9 +187,9 @@ def create_viewer_ui():
         min=1.0,
         max=64.0,
         step=0.5,
-        description="Zoom out:",
+        description="Zoom:",
         readout_format=".1f",
-        layout=widgets.Layout(width="80%"),
+        layout=widgets.Layout(width="50%"),
         style={"description_width": "80px"},
         continuous_update=True,
     )
@@ -212,15 +244,13 @@ def create_viewer_ui():
         tile_word = "tile" if count == 1 else "tiles"
         status_label.value = f"<b>Selected:</b> {count} {tile_word}"
 
-    def render_view():
-        """Re-render the zoomed viewport and the thumbnail overlay."""
+    def render_main_view():
+        """Re-render the zoomed main viewport (tissue + grid + selection)."""
         if state["slide"] is None:
             return
 
         slide = state["slide"]
         downsample = zoom_slider.value
-        slide_w = state["slide_w"]
-        slide_h = state["slide_h"]
 
         viewport = current_viewport()
         x0, y0 = viewport[0], viewport[1]
@@ -270,21 +300,70 @@ def create_viewer_ui():
             )
 
         view_widget.value = pil_to_png_bytes(view_img)
+        update_status_label()
 
-        thumb_copy = state["thumbnail"].copy()
+    def render_thumbnail():
+        """
+        Re-render the thumbnail overview: selection fill/outline (scaled to
+        thumbnail pixels) plus the current viewport rectangle. Split out
+        from `render_main_view` so a paint-stroke drag can update the main
+        viewport on every tile without also redoing the thumbnail's own
+        selection pass and PNG encode on every step -- the thumbnail only
+        needs to catch up once the drag ends.
+        """
+        if state["slide"] is None:
+            return
+
+        slide_w = state["slide_w"]
+        slide_h = state["slide_h"]
+        viewport = current_viewport()
+
+        thumb_scale_x = state["thumb_w"] / slide_w
+        thumb_scale_y = state["thumb_h"] / slide_h
+
+        thumb_fill_overlay = Image.new("RGBA", state["thumbnail"].size, (0, 0, 0, 0))
+        thumb_fill_draw = ImageDraw.Draw(thumb_fill_overlay)
+        for row, col in state["selected_tiles"]:
+            tile_x, tile_y = tile_to_pixel(row, col, GRID_ORIGIN, TILE_SIZE_LEVEL0)
+            tfx0 = tile_x * thumb_scale_x
+            tfy0 = tile_y * thumb_scale_y
+            tfx1 = (tile_x + TILE_SIZE_LEVEL0) * thumb_scale_x
+            tfy1 = (tile_y + TILE_SIZE_LEVEL0) * thumb_scale_y
+            thumb_fill_draw.rectangle([tfx0, tfy0, tfx1, tfy1], fill=SELECTED_FILL_COLOR + (SELECTED_FILL_ALPHA,))
+        thumb_copy = Image.alpha_composite(state["thumbnail"].convert("RGBA"), thumb_fill_overlay)
+
+        outline_segments = compute_selection_outlines(
+            state["selected_tiles"], GRID_ORIGIN, TILE_SIZE_LEVEL0
+        )
         draw = ImageDraw.Draw(thumb_copy)
+        for (seg_x0, seg_y0), (seg_x1, seg_y1) in outline_segments:
+            tsx0 = seg_x0 * thumb_scale_x
+            tsy0 = seg_y0 * thumb_scale_y
+            tsx1 = seg_x1 * thumb_scale_x
+            tsy1 = seg_y1 * thumb_scale_y
+            draw.line([(tsx0, tsy0), (tsx1, tsy1)], fill=SELECTED_COLOR, width=1)
 
         rx0, ry0, rx1, ry1 = compute_viewport_rect_on_map(
-            (x0, y0, viewport[2], viewport[3]),
-            slide_w,
-            slide_h,
-            state["thumb_w"],
-            state["thumb_h"],
+            viewport, slide_w, slide_h, state["thumb_w"], state["thumb_h"]
         )
         draw.rectangle([rx0, ry0, rx1, ry1], outline="red", width=2)
-        thumb_widget.value = pil_to_png_bytes(thumb_copy)
+        thumb_widget.value = pil_to_png_bytes(thumb_copy.convert("RGB"))
 
-        update_status_label()
+    def render_view():
+        """Full re-render: main viewport + thumbnail overview + status label."""
+        render_main_view()
+        render_thumbnail()
+
+    def sync_pan_sliders():
+        """
+        Reflect state's center_x/center_y onto the pan sliders, without
+        re-triggering their own change handlers (which would otherwise
+        re-set center_x/center_y from the slider and double-render).
+        """
+        state["syncing_pan_sliders"] = True
+        horizontal_pan_slider.value = state["center_x"]
+        vertical_pan_slider.value = state["slide_h"] - state["center_y"]
+        state["syncing_pan_sliders"] = False
 
     # ──────────────────────────────────────────
     # Mouse interaction on thumbnail
@@ -299,6 +378,7 @@ def create_viewer_ui():
         )
         state["center_x"] = center_x
         state["center_y"] = center_y
+        sync_pan_sliders()
         render_view()
 
     def handle_mouse(event):
@@ -315,6 +395,27 @@ def create_viewer_ui():
             set_position_from_mouse(event)
 
     thumb_event.on_dom_event(handle_mouse)
+
+    # ──────────────────────────────────────────
+    # Pan sliders (alternative to click/drag on the thumbnail)
+    # ──────────────────────────────────────────
+
+    def on_horizontal_pan_change(change):
+        if state["syncing_pan_sliders"] or state["slide"] is None:
+            return
+        state["center_x"] = change["new"]
+        render_view()
+
+    def on_vertical_pan_change(change):
+        if state["syncing_pan_sliders"] or state["slide"] is None:
+            return
+        # Vertical slider's value increases upward; center_y increases
+        # downward, hence the flip.
+        state["center_y"] = state["slide_h"] - change["new"]
+        render_view()
+
+    horizontal_pan_slider.observe(on_horizontal_pan_change, names="value")
+    vertical_pan_slider.observe(on_vertical_pan_change, names="value")
 
     # ──────────────────────────────────────────
     # Click-and-drag ("paint-stroke") tile selection on the main viewport
@@ -343,7 +444,10 @@ def create_viewer_ui():
             return
         state["last_painted_tile"] = (row, col)
         set_tile(state["selected_tiles"], row, col, state["paint_value"])
-        render_view()
+        # Main viewport only during the drag -- the thumbnail catches up
+        # once on mouseup instead of redoing its own selection pass and PNG
+        # encode on every tile touched mid-drag.
+        render_main_view()
 
     def handle_view_mouse(event):
         if state["slide"] is None:
@@ -359,6 +463,7 @@ def create_viewer_ui():
         elif etype == "mouseup":
             state["is_painting"] = False
             state["last_painted_tile"] = None
+            render_thumbnail()
         elif etype == "mousemove" and state["is_painting"]:
             row, col = resolve_event_to_tile(event)
             paint_tile(row, col)
@@ -464,10 +569,16 @@ def create_viewer_ui():
         thumb_widget.width = state["thumb_w"]
         thumb_widget.height = state["thumb_h"]
 
+        horizontal_pan_slider.max = state["slide_w"]
+        horizontal_pan_slider.layout.width = f"{state['thumb_w']}px"
+        vertical_pan_slider.max = state["slide_h"]
+        vertical_pan_slider.layout.height = f"{state['thumb_h']}px"
+
         state["center_x"] = state["slide_w"] // 2
         state["center_y"] = state["slide_h"] // 2
         state["selected_tiles"] = set()
         state["last_painted_tile"] = None
+        sync_pan_sliders()
 
         mpp_str = f"{metadata['mpp']:.4f} µm/px" if metadata["mpp"] else "N/A"
         obj_str = f"{metadata['objective']}×" if metadata["objective"] else "N/A"

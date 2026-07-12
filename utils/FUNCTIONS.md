@@ -96,9 +96,57 @@ Implemented so far, step by step, each checked in the running Jupyter session
    never destroy a still-valid slide/selection you already had loaded.
    Per instruction, the Annotator ID field is left untouched on a JSON
    load — the file's own `annotator_id` is never read back into the input.
+8. **UI polish pass: quieter logging, output placement, thumbnail selection
+   view, pan sliders, drag performance.**
+   - Resuming from a JSON is now silent on success — the "Loading
+     annotations / Found slide / Restored N tiles" progress lines were
+     removed from `load_annotation_json`; only failures print (schema
+     problems, slide not found, dimension/grid mismatch), since those are
+     the only cases needing the pathologist's attention.
+   - Complete's "Saved N tile records to ..." confirmation moved out of the
+     top `output_area` into a new `complete_output` widget placed directly
+     under the status/Reset/Complete row, so it appears next to the button
+     that produced it instead of scrolled away above the viewer.
+   - "Please choose a file." now only prints if no slide has ever been
+     loaded (`state["slide"] is None`) — clicking Load again with nothing
+     newly selected while a slide is already active is now a silent no-op
+     instead of nagging.
+   - **Thumbnail now shows the selection too**, not just the viewport
+     rectangle: same fill/outline as the main viewport (via
+     `selection.py`'s `compute_selection_outlines`, reused rather than
+     recomputed), scaled to thumbnail pixels instead of viewport pixels.
+   - **Render split for drag performance:** `render_view` split into
+     `render_main_view` (tissue + grid + selection) and `render_thumbnail`
+     (overview + selection + viewport rect). A paint-stroke drag now only
+     calls `render_main_view` per tile touched; `render_thumbnail` runs
+     once on `mouseup` instead of once per tile, cutting duplicate
+     full-selection-set iteration + a second PNG encode out of the hot
+     path. `render_view()` (both, used everywhere else — pan, zoom, reset,
+     load) is unchanged.
+   - **Pan sliders added:** a vertical `IntSlider` left of the thumbnail and
+     a horizontal one directly beneath it (nested in their own `VBox` so the
+     horizontal slider aligns under the thumbnail specifically, not the
+     whole row including the vertical slider), sized/ranged to the loaded
+     slide in `_commit_slide`. New `sync_pan_sliders()` keeps them in sync
+     with panning via thumbnail click/drag and vice versa, guarded by a
+     `state["syncing_pan_sliders"]` flag against feedback-loop
+     double-renders. Vertical slider value increases *upward*
+     (ipywidgets' convention for vertical orientation), so it's inverted
+     against `center_y` (which increases downward) — verified against the
+     real slide (top of slider → `center_y=0`, bottom → `center_y=slide_h`).
+   - **Gotcha for future layout work:** installed ipywidgets (8.1.8)'s
+     `Layout` has no `gap` trait for `HBox`/`VBox` — passing `gap=...` is
+     silently accepted but does nothing (confirmed via
+     `Layout.class_trait_names()`). `image_row`'s existing `gap="20px"` was
+     never actually doing anything either. Spacing between Box children has
+     to be set via each child's own `margin`.
+   - `viewer_dev.ipynb` gained a setup cell injecting CSS to widen the
+     notebook to full browser width (`.container` for classic Notebook,
+     `--jp-notebook-max-width` for JupyterLab) — currently commented out
+     in the notebook.
 
-Git initialized; first commit covers steps 1-3 above (steps 4-7 not yet
-committed). `grid.py`, `viewport.py`'s navigation/click-resolution
+Two commits so far: the first covers steps 1-3, the second (`9bc81ed`)
+covers steps 4-7. `grid.py`, `viewport.py`'s navigation/click-resolution
 functions, and `export.py` are fully implemented. Not started yet:
 `anonymize.py` and `zoom.py` (the slider still shows a raw downsample
 factor, not a magnification). See per-file status notes below.
