@@ -9,13 +9,24 @@ from utils.grid import tile_to_pixel
 _SIDES = ("top", "bottom", "left", "right")
 
 
-def toggle_tile(selected_tiles: set[tuple[int, int]], row: int, col: int) -> set[tuple[int, int]]:
-    """Flip a tile's membership in place (SPEC §5.1: odd clicks -> selected, even -> unselected)."""
+def set_tile(
+    selected_tiles: set[tuple[int, int]], row: int, col: int, selected: bool
+) -> set[tuple[int, int]]:
+    """
+    Set a tile's membership explicitly, in place.
+
+    A plain click still behaves like a toggle (SPEC §5.1) — the caller
+    decides `selected` from the tile's state at the start of the
+    click/drag — but a drag-to-paint stroke needs to *set* every tile it
+    passes over to that same value rather than flip each one individually,
+    or a tile would flicker on/off if the cursor re-entered it mid-drag
+    (SPEC §8).
+    """
     tile = (row, col)
-    if tile in selected_tiles:
-        selected_tiles.discard(tile)
-    else:
+    if selected:
         selected_tiles.add(tile)
+    else:
+        selected_tiles.discard(tile)
     return selected_tiles
 
 

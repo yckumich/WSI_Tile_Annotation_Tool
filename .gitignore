@@ -2,9 +2,14 @@
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+.DS_Store
 
 # Patient-derived whole-slide images — not committed (size + blinding/privacy, see SPEC.md §2)
 slides/*.svs
 slides/*.ndpi
 slides/*.tiff
 slides/*.tif
+
+# Exported annotations — currently include the real slide filename (no
+# anonymize.py yet, see SPEC.md §2); not committed until that's addressed.
+annotations/

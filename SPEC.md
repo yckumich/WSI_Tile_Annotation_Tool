@@ -220,9 +220,9 @@ Writes a single JSON file.
 - `width`, `height` — `tile_size_level0`
 - `selected` — boolean
 
-**Export every tile in the grid, not just the selected ones.** The unselected tiles are not noise — they are the pathologist's implicit judgment that those regions were *not* important, and the enrichment analysis needs a background set to compare against. Exporting only positives discards half the signal.
+**The `tiles` list contains only selected tiles** (revised from an earlier draft that wrote every tile in the grid). The unselected tiles still matter — they're the pathologist's implicit judgment that those regions were *not* important, and the enrichment analysis needs that background set to compare against — but they don't need to be written out literally to preserve that signal: `grid_origin`, `tile_size_level0`, `n_rows`, and `n_cols` in the slide-level metadata are enough to regenerate every `(row, col)` in the grid and its pixel coordinates, so any tile *not* present in `tiles` is unambiguously unselected. This keeps the export lossless while avoiding writing tens of thousands of mostly-`selected: false` records.
 
-> Because no tissue mask is applied in v1, the export will include many blank-glass tiles. These should be filtered at **analysis** time (they were never real candidates and would dilute the enrichment statistics), even though they are harmless in the UI.
+> Because no tissue mask is applied in v1, the *reconstructed* full grid will include many blank-glass tiles among the unselected background. These should be filtered at **analysis** time (they were never real candidates and would dilute the enrichment statistics), even though they are harmless in the UI.
 
 ---
 

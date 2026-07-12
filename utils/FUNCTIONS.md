@@ -19,12 +19,89 @@ Implemented so far, step by step, each checked in the running Jupyter session
    = 448` and `GRID_ORIGIN = (0, 0)` are hardcoded in `widgets/viewer.py`
    pending confirmation of the model's real tiling convention (SPEC §6.3) —
    **must revisit before real annotation collection.**
+3. **Tile selection with merged union outlines + translucent fill.** Clicking
+   toggles a tile; adjacent selected tiles merge into one outline instead of
+   a lattice of boxes, with holes rendered for deselected interior tiles
+   (SPEC §5.3). Selected tiles also get a 50%-opacity gray wash (SPEC §4.3,
+   revised from an original outlines-only decision — see SPEC.md for the
+   reasoning). Built on `viewport.py`'s `resolve_click_to_tile` and
+   `selection.py`'s `compute_boundary_edges`/`compute_selection_outlines`.
+4. **Click-and-drag ("paint-stroke") selection.** Dragging across the main
+   viewport selects (or erases) every tile the cursor passes over, not just
+   start/end — chosen over a rectangle/marquee selection because tumor
+   regions are irregular, not axis-aligned boxes (SPEC §8). The value painted
+   for the whole stroke is decided once, from the tile under `mousedown`, and
+   every tile touched is *set* to that value rather than toggled, so a tile
+   doesn't flicker if the cursor re-enters it mid-drag. `selection.py`'s
+   `set_tile` replaced the earlier `toggle_tile` (a plain click — mousedown
+   with no movement — still behaves like a toggle, just computed from the
+   starting tile's state rather than by calling a literal toggle function).
+5. **Selection status bar + Reset + Complete/export.** A "Selected: N tiles"
+   label refreshed on every render, a Reset button (clears the current
+   slide's selection; also now happens automatically when a *new* slide is
+   loaded — fixed a latent bug where a previous slide's selection carried
+   over), and a Complete button that writes a JSON export via the new
+   `export.py` (SPEC §7). The export is deliberately more complete than
+   SPEC §7's own metadata list — it's designed to be reloadable later to
+   resume an in-progress slide, not just consumed by the downstream
+   enrichment analysis, per an explicit ask to make it precise/comprehensive
+   enough for that. Added an "Annotator ID" text input to populate that
+   metadata field, since nothing collected it before. **Known gap:**
+   `slide_filename`/`slide_path` in the export are the real filename/path,
+   because `anonymize.py` doesn't exist yet (SPEC §2) — close that before
+   using this for real annotation collection. The "load JSON to resume"
+   half of this feature is not built yet — only the export side.
+   **Naming/overwrite behavior revised (superseded step 5's original
+   choice):** writes to `annotations/{slide_stem}_{annotator_slug}_
+   {timestamp}.json` (e.g. `8130_Reva-Basho_20260711T212640Z.json`) instead
+   of a single `{slide_stem}.json` overwritten in place — so multiple saves
+   sort chronologically by filename and never clobber each other.
+   `export.py`'s `build_slide_metadata` now takes `timestamp` as an explicit
+   param (was generated internally via `datetime.now()`) so the same
+   instant drives both the JSON content and the filename. A future "resume"
+   loader will need to pick the latest file for a given slide stem (sort by
+   filename, take the last).
+6. **`tiles` list holds only selected tiles, not the full grid.** Originally
+   wrote all ~39K tiles per slide (SPEC §7's original wording); revised
+   because the unselected background set doesn't need to be written out
+   literally to stay recoverable — `grid_origin`/`tile_size_level0`/
+   `n_rows`/`n_cols` in the slide metadata are enough to regenerate the full
+   grid at analysis time, and anything not in `tiles` is unselected by
+   definition. SPEC.md §7 updated to match. Cut a 5-selected-tile test
+   export from ~5.8MB to ~1.2KB.
+7. **Resume from an exported JSON.** The file chooser now accepts `.json` as
+   well as WSI files (title changed "Select WSI File" → "Choose file", Load
+   button "Load Slide" → "Load"); `on_load_click` dispatches on file
+   extension. Loading a JSON runs, in order: (1) `export.py`'s new
+   `validate_annotation_payload` — structural check that every field
+   resuming actually depends on is present, and that `export_schema_version`
+   matches; (2) resolve the referenced slide — try the recorded
+   `slide_path`, fall back to `SLIDES_DIR / slide_filename` (handles the
+   common case of the file moving or the JSON being opened on a different
+   machine/cwd); (3) once opened, compare the *live* slide's dimensions,
+   plus the app's current `TILE_SIZE_LEVEL0`/`GRID_ORIGIN`, against what the
+   JSON recorded — a mismatch on any of these means "pathologist tile
+   (12, 30)" could silently be different tissue than "model tile (12, 30)"
+   (SPEC §6.4), so it's a hard failure, not a warning; (4) only if all of
+   that passes are `tiles` added to `selected_tiles` and the slide
+   committed as active. Every failure mode prints exactly which check
+   failed and tells the user to choose a different file — verified for all
+   six paths (happy path, missing required field, slide not found, path
+   fallback resolution, dimension mismatch, grid-config mismatch) with a
+   simulation script against the real `8130.svs`.
 
-`grid.py` and `viewport.py`'s navigation functions are fully implemented.
-Not started yet: click-to-select tiles (`canvas_to_slide_coords`,
-`resolve_click_to_tile`), all of `selection.py`, `export.py`, `anonymize.py`,
-and `zoom.py` (the slider still shows a raw downsample factor, not a
-magnification). See per-file status notes below.
+   The candidate slide is opened into a local variable and only swapped
+   into `state` (via a new shared `_commit_slide` helper, also now used by
+   the plain-WSI load path) once every check has passed — so a bad JSON can
+   never destroy a still-valid slide/selection you already had loaded.
+   Per instruction, the Annotator ID field is left untouched on a JSON
+   load — the file's own `annotator_id` is never read back into the input.
+
+Git initialized; first commit covers steps 1-3 above (steps 4-7 not yet
+committed). `grid.py`, `viewport.py`'s navigation/click-resolution
+functions, and `export.py` are fully implemented. Not started yet:
+`anonymize.py` and `zoom.py` (the slider still shows a raw downsample
+factor, not a magnification). See per-file status notes below.
 
 ---
 
@@ -85,52 +162,80 @@ continuous downsample factor.
 
 ## `viewport.py` — navigation, panning, and click resolution (SPEC §3, §4.1, §5.2)
 
-**Status: navigation done, tile-click resolution not started.**
-`compute_viewport`, `clamp_viewport`, `compute_viewport_rect_on_map`,
-`map_click_to_center`, and `visible_grid_lines` are implemented and driving
-the current viewer. `canvas_to_slide_coords` and `resolve_click_to_tile` are
-still pending — they're the next step (clicking a tile *in the main
-viewport*, as opposed to clicking the overview map to pan, which is already
-done via `map_click_to_center`).
+**Status: done.** All six functions below are implemented and driving the
+current viewer. Two signature deviations from the original plan:
+`canvas_to_slide_coords` and `resolve_click_to_tile` gained explicit
+`canvas_width`/`canvas_height` params, since the planned 3/5-arg signatures
+didn't carry enough information to recover the downsample factor from a
+level-0-sized viewport tuple alone.
 
 Ties the overview map, the main viewport, and the click → tile chain together.
 
 - `compute_viewport(center_x, center_y, downsample, canvas_width, canvas_height)` — level-0 region `(x, y, width, height)` to render, given a center point + zoom + canvas size. ✅
 - `clamp_viewport(viewport, slide_width, slide_height)` — keep the viewport within slide bounds. ✅
-- `canvas_to_slide_coords(canvas_x, canvas_y, viewport)` — click chain step 1–2: canvas pixel → level-0 slide coordinate (§5.2). — not started
-- `resolve_click_to_tile(canvas_x, canvas_y, viewport, grid_origin, tile_size_level0)` — full click chain: canvas pixel → level-0 coordinate → `(row, col)` (§5.2). Composes `canvas_to_slide_coords` + `pixel_to_tile`. — not started
+- `canvas_to_slide_coords(canvas_x, canvas_y, viewport, canvas_width, canvas_height)` — click chain step 1–2: canvas pixel → level-0 slide coordinate (§5.2). ✅
+- `resolve_click_to_tile(canvas_x, canvas_y, viewport, canvas_width, canvas_height, grid_origin, tile_size_level0)` — full click chain: canvas pixel → level-0 coordinate → `(row, col)` (§5.2). Composes `canvas_to_slide_coords` + `pixel_to_tile`. ✅
 - `compute_viewport_rect_on_map(viewport, slide_width, slide_height, thumbnail_width, thumbnail_height)` — rectangle (thumbnail pixel coords) marking the current viewport on the overview map; shrinks/grows with zoom (§4.1). ✅
 - `map_click_to_center(map_x, map_y, thumbnail_width, thumbnail_height, slide_width, slide_height)` — click on the overview map → level-0 point the main viewport should recenter on (§4.1, click-to-recenter / drag-to-pan). ✅
 - `visible_grid_lines(viewport, grid_origin, tile_size_level0)` — row/column grid-line positions, computed on the fly for only the visible region (§4.3). ✅
 
 ---
 
-## `selection.py` — toggle state and union-outline geometry (SPEC §5)
+## `selection.py` — selection state and union-outline geometry (SPEC §5)
 
-**Status: not started.** Next major step after tile-click resolution
-(`viewport.py`'s `resolve_click_to_tile`) lands.
+**Status: mostly done**, with deviations from the original plan. `toggle_tile`
+was replaced by `set_tile(selected_tiles, row, col, selected)`, which sets
+membership explicitly rather than flipping it — needed once drag-to-paint
+landed (SPEC §8): a plain click still computes a toggle (from the tile's
+state at the start of the click), but a paint stroke needs to set every tile
+it passes over to the *same* value or a re-visited tile would flicker.
+`find_connected_components` and `trace_outline_polygons` were skipped
+entirely: since annotation is drawn as outlines/wash, never a filled
+polygon, a flat list of boundary line segments renders identically to
+stitched closed polygons and is much simpler — see `compute_selection_outlines`.
+Revisit `trace_outline_polygons` only if something later needs actual closed
+polygon geometry (e.g. exporting outline shapes, not just tile records).
 
 The behavioral core of the tool. Selection is a set of `(row, col)`; rendering
 is a pure function of that set (§6.5).
 
-- `toggle_tile(selected_tiles, row, col)` — flip membership in place (§5.1: odd clicks → selected, even → unselected).
-- `find_connected_components(selected_tiles)` — group selected tiles into 4-connected components (§5.3: edge-sharing only, corner touches don't merge).
-- `compute_boundary_edges(selected_tiles)` — the set of grid edges that separate a selected tile from an unselected/outside one (§5.3 formal definition).
-- `trace_outline_polygons(edges)` — stitch boundary edges into closed polygon loops — outer boundary per component *and* boundaries around any holes from deselected interior tiles (§5.3: "deselecting a tile inside a cluster creates a hole").
-- `compute_selection_outlines(selected_tiles, grid_origin, tile_size_level0)` — top-level: selection set → outline polygons in level-0 pixel coordinates, ready to hand to the renderer.
+- `set_tile(selected_tiles, row, col, selected)` — set membership explicitly, in place (§5.1, §8). ✅
+- ~~`find_connected_components(selected_tiles)`~~ — skipped, not needed for outline-only (no-fill) rendering.
+- `compute_boundary_edges(selected_tiles)` — the set of grid edges that separate a selected tile from an unselected/outside one (§5.3 formal definition). ✅
+- ~~`trace_outline_polygons(edges)`~~ — skipped; `compute_selection_outlines` draws boundary edges as independent line segments instead of stitching closed loops.
+- `compute_selection_outlines(selected_tiles, grid_origin, tile_size_level0)` — top-level: selection set → outline line segments in level-0 pixel coordinates, ready to hand to the renderer. ✅
 
 ---
 
 ## `export.py` — JSON export on Complete (SPEC §7)
 
-**Status: not started.**
+**Status: done**, with signature deviations from the original plan:
+`slide_id` became `slide_path` (no `anonymize.py` yet, see the known-gap note
+in Progress above), and `downsample`/`n_rows`/`n_cols` are no longer caller
+params — `build_slide_metadata` derives `n_rows`/`n_cols` itself via
+`grid.py`'s `compute_grid_dimensions` (so they can't drift out of sync with
+the grid params in the same call) and adds a `tile_downsample` field
+(`tile_size_level0 / tile_size_native`) instead of taking it as an opaque
+input. Also added an `export_schema_version` field and a `timestamp` (UTC,
+set at write time) not in the original bullet list, both aimed at the
+future "reload this JSON to resume" feature — schema version so a future
+loader can detect an incompatible file, timestamp so multiple saves of the
+same slide are distinguishable.
 
-Exports every tile in the grid, not just selected ones — the unselected tiles
-are the background set the enrichment analysis needs.
+**Also revised from SPEC §7's original wording:** `build_tile_records` now
+writes only *selected* tiles, not the full grid, and dropped the now-unused
+`n_rows`/`n_cols` params as a result. The unselected background set the
+enrichment analysis needs is still fully recoverable — `grid_origin`,
+`tile_size_level0`, `n_rows`, `n_cols` in the slide metadata are enough to
+regenerate every `(row, col)` in the grid, so anything absent from `tiles`
+is unselected by definition. This cut a 5-tile test export from ~5.8MB
+(full grid) to ~1.2KB. SPEC.md §7 updated to match.
 
-- `build_slide_metadata(slide_id, slide_width, slide_height, tile_size_level0, tile_size_native, native_magnification, mpp, downsample, grid_origin, n_rows, n_cols, annotator_id, tool_version)` — assemble the slide-level metadata block (§7).
-- `build_tile_records(grid_origin, tile_size_level0, n_rows, n_cols, selected_tiles)` — one record per tile — `row`, `col`, `x`, `y`, `width`, `height`, `selected` — for the *entire* grid (§7).
-- `export_annotations(output_path, slide_metadata, tile_records)` — write the combined metadata + tile records to a single JSON file (§7).
+- `build_slide_metadata(slide_path, slide_width, slide_height, tile_size_level0, tile_size_native, native_magnification, mpp, grid_origin, annotator_id, tool_version, timestamp)` — assemble the slide-level metadata block (§7). `timestamp` is caller-supplied (ISO string) rather than generated internally, so `widgets/viewer.py` can reuse the same instant for the export filename. ✅
+- `build_tile_records(grid_origin, tile_size_level0, selected_tiles)` — one record per *selected* tile — `row`, `col`, `x`, `y`, `width`, `height`, `selected` (§7, revised). ✅
+- `export_annotations(output_path, slide_metadata, tile_records)` — write the combined metadata + tile records to a single JSON file (§7). ✅
+
+**Import/resume, not in the original plan** (v1 scope didn't include resuming — added once asked for): `validate_annotation_payload(data)` — structural check (required `slide_metadata` fields present, `export_schema_version` matches, `tiles` well-formed) on a loaded annotation file, *before* anything tries to reopen the slide it points to. Returns a list of human-readable problems, empty if clean. Deliberately checks only fields resuming actually depends on (e.g. not `mpp`/`annotator_id`, which are informational). The slide-exists/dimensions/grid-config checks that follow schema validation live in `widgets/viewer.py`'s `load_annotation_json`, not here — they need `slide_io.py`'s `open_slide`, and orchestrating "open a candidate slide, compare, maybe roll back" is app-layer flow control, not pure validation. ✅
 
 ---
 
