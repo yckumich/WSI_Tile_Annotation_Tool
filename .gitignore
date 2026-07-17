@@ -13,3 +13,7 @@ slides/*.tif
 # Exported annotations — currently include the real slide filename (no
 # anonymize.py yet, see SPEC.md §2); not committed until that's addressed.
 annotations/
+
+# New/local markdown notes -- doesn't affect already-tracked CLAUDE.md,
+# SPEC.md, or utils/FUNCTIONS.md.
+*.md

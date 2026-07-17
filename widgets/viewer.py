@@ -110,7 +110,7 @@ def create_viewer_ui():
     # ── Annotator ID (SPEC §7 slide-level metadata) ──
     annotator_input = widgets.Text(
         value="",
-        placeholder="e.g. reva",
+        placeholder="e.g. Ye Chan Kim",
         description="Annotator ID:",
         layout=widgets.Layout(width="300px"),
         style={"description_width": "100px"},
