@@ -52,3 +52,22 @@ def pixel_to_tile(
 def is_tile_in_grid(row: int, col: int, n_rows: int, n_cols: int) -> bool:
     """Bounds check."""
     return 0 <= row < n_rows and 0 <= col < n_cols
+
+
+def compute_tiles_centroid(
+    tiles: set[tuple[int, int]], grid_origin: tuple[int, int], tile_size_level0: int
+) -> tuple[float, float]:
+    """
+    Average tile-center position, in level-0 pixels, across `tiles` (Cluster
+    Annotations §7 -- used to recenter the viewport on a cluster when its
+    note row's swatch is clicked). `tiles` is assumed non-empty -- a cluster
+    with zero tiles doesn't exist by construction (Cluster Annotations §2).
+    """
+    sum_x = 0.0
+    sum_y = 0.0
+    for row, col in tiles:
+        x, y = tile_to_pixel(row, col, grid_origin, tile_size_level0)
+        sum_x += x + tile_size_level0 / 2
+        sum_y += y + tile_size_level0 / 2
+    n = len(tiles)
+    return sum_x / n, sum_y / n

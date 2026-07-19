@@ -1,14 +1,15 @@
-"""JSON export on Complete (SPEC §7).
+"""JSON export on Complete (Cluster Annotations §3).
 
-Only selected tiles are written to the `tiles` list. The unselected
-background set the enrichment analysis needs isn't lost, though: slide-level
-metadata carries `grid_origin`, `tile_size_level0`, `n_rows`, and `n_cols`,
-which are enough to regenerate every `(row, col)` in the grid and its pixel
-coordinates — any tile not present in `tiles` is unambiguously unselected.
-This file is also meant to be re-loadable later to resume an in-progress
-slide, so the slide-level metadata block carries everything needed to
-reopen the exact slide and rebuild the exact grid, not just what SPEC §7
-lists for downstream analysis.
+Only selected tiles are written, grouped into the `clusters` list -- each
+cluster's own `tiles` are always selected. The unselected background set the
+enrichment analysis needs isn't lost, though: slide-level metadata carries
+`grid_origin`, `tile_size_level0`, `n_rows`, and `n_cols`, which are enough
+to regenerate every `(row, col)` in the grid and its pixel coordinates — any
+tile not present in any cluster's `tiles` is unambiguously unselected. This
+file is also meant to be re-loadable later to resume an in-progress slide,
+so the slide-level metadata block carries everything needed to reopen the
+exact slide and rebuild the exact grid, not just what's needed for
+downstream analysis.
 """
 
 import json
@@ -16,7 +17,7 @@ from pathlib import Path
 
 from utils.grid import compute_grid_dimensions, tile_to_pixel
 
-EXPORT_SCHEMA_VERSION = 1
+EXPORT_SCHEMA_VERSION = 2
 
 
 def build_slide_metadata(
@@ -66,37 +67,53 @@ def build_slide_metadata(
     }
 
 
-def build_tile_records(
+def _tile_record(row: int, col: int, grid_origin: tuple[int, int], tile_size_level0: int) -> dict:
+    """A single tile's row/col/x/y/width/height/selected record (SPEC §7)."""
+    x, y = tile_to_pixel(row, col, grid_origin, tile_size_level0)
+    return {
+        "row": row,
+        "col": col,
+        "x": x,
+        "y": y,
+        "width": tile_size_level0,
+        "height": tile_size_level0,
+        "selected": True,
+    }
+
+
+def build_cluster_records(
     grid_origin: tuple[int, int],
     tile_size_level0: int,
-    selected_tiles: set[tuple[int, int]],
+    cluster_state: dict,
 ) -> list[dict]:
     """
-    One record per *selected* tile — row, col, x, y, width, height, selected
-    (SPEC §7, revised: only selected tiles are written, not the full grid —
-    see module docstring for how the unselected background is still
-    reconstructable from slide-level metadata).
+    One record per cluster (Cluster Annotations §3.2): its tiles (row, col,
+    x, y, width, height, selected -- always selected: true, since only
+    selected tiles are ever written, see module docstring), `tile_count`,
+    `color`, and `note`. Clusters are ordered by ascending cluster_id --
+    stable across a session even as clusters grow/shrink/merge/split -- and
+    each cluster's own tiles are ordered by (row, col).
     """
     records = []
-    for row, col in sorted(selected_tiles):
-        x, y = tile_to_pixel(row, col, grid_origin, tile_size_level0)
+    for cluster_id in sorted(cluster_state["clusters"]):
+        cluster = cluster_state["clusters"][cluster_id]
         records.append(
             {
-                "row": row,
-                "col": col,
-                "x": x,
-                "y": y,
-                "width": tile_size_level0,
-                "height": tile_size_level0,
-                "selected": True,
+                "tiles": [
+                    _tile_record(row, col, grid_origin, tile_size_level0)
+                    for row, col in sorted(cluster["tiles"])
+                ],
+                "tile_count": len(cluster["tiles"]),
+                "color": cluster["color"],
+                "note": cluster["note"],
             }
         )
     return records
 
 
-def export_annotations(output_path: str, slide_metadata: dict, tile_records: list[dict]) -> None:
-    """Write the combined metadata + tile records to a single JSON file (SPEC §7)."""
-    payload = {"slide_metadata": slide_metadata, "tiles": tile_records}
+def export_annotations(output_path: str, slide_metadata: dict, cluster_records: list[dict]) -> None:
+    """Write the combined metadata + cluster records to a single JSON file (Cluster Annotations §3.1)."""
+    payload = {"slide_metadata": slide_metadata, "clusters": cluster_records}
     with open(output_path, "w") as f:
         json.dump(payload, f, indent=2)
 
@@ -149,14 +166,19 @@ def validate_annotation_payload(data: dict) -> list[str]:
                 f"(this tool writes/reads version {EXPORT_SCHEMA_VERSION})"
             )
 
-    if "tiles" not in data:
-        problems.append("missing top-level 'tiles' key")
-    elif not isinstance(data["tiles"], list):
-        problems.append("'tiles' is not a list")
+    if "clusters" not in data:
+        problems.append("missing top-level 'clusters' key")
+    elif not isinstance(data["clusters"], list):
+        problems.append("'clusters' is not a list")
     else:
-        for i, tile in enumerate(data["tiles"]):
-            if "row" not in tile or "col" not in tile:
-                problems.append(f"tile record {i} is missing 'row' or 'col'")
-                break
+        for i, cluster in enumerate(data["clusters"]):
+            for field in ("tiles", "tile_count", "color", "note"):
+                if field not in cluster:
+                    problems.append(f"cluster record {i} is missing '{field}'")
+            if "tiles" in cluster:
+                for tile in cluster["tiles"]:
+                    if "row" not in tile or "col" not in tile:
+                        problems.append(f"cluster record {i} has a tile missing 'row' or 'col'")
+                        break
 
     return problems

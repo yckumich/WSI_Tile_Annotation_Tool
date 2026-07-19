@@ -17,13 +17,20 @@ from ipyfilechooser import FileChooser
 from PIL import Image, ImageDraw
 
 from utils.export import (
+    build_cluster_records,
     build_slide_metadata,
-    build_tile_records,
     export_annotations,
     validate_annotation_payload,
 )
-from utils.grid import tile_to_pixel
-from utils.selection import compute_selection_outlines, set_tile
+from utils.grid import compute_tiles_centroid, tile_to_pixel
+from utils.selection import (
+    all_selected_tiles,
+    cluster_state_from_clusters,
+    compute_selection_outlines,
+    create_cluster_state,
+    deselect_tile,
+    select_tile,
+)
 from utils.slide_io import (
     open_slide,
     get_slide_metadata,
@@ -61,8 +68,13 @@ TILE_SIZE_NATIVE = 224  # the model's tile size @ 20x (SPEC §6.3)
 GRID_COLOR = (211, 211, 211)  # light gray — visible without obscuring tissue
 SELECTED_COLOR = (40, 40, 40)  # dark outline for selected tiles (SPEC §5.3)
 SELECTED_WIDTH = 2
-SELECTED_FILL_COLOR = (128, 128, 128)  # translucent gray wash (SPEC §4.3, revised)
-SELECTED_FILL_ALPHA = 128  # ~0.5 opacity at 8-bit
+SELECTED_FILL_ALPHA = 128  # ~0.5 opacity at 8-bit, per cluster (Cluster Annotations §5)
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    """"#rrggbb" -> (r, g, b), for PIL's fill= which needs plain numbers, not a hex string."""
+    hex_color = hex_color.lstrip("#")
+    return (int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16))
 
 
 def create_viewer_ui():
@@ -93,11 +105,12 @@ def create_viewer_ui():
         "center_x": 0,
         "center_y": 0,
         "is_dragging": False,
-        "selected_tiles": set(),
+        "cluster_state": create_cluster_state(),
         "is_painting": False,
         "paint_value": None,
         "last_painted_tile": None,
         "syncing_pan_sliders": False,
+        "note_widgets": {},  # cluster_id -> {"row": HBox, "textarea": Textarea}
     }
 
     # ── File chooser (a WSI file to start fresh, or a previously exported
@@ -212,9 +225,15 @@ def create_viewer_ui():
     )
     complete_output = widgets.Output()
 
+    # ── Cluster notes: one row per currently-existing cluster (color swatch
+    #    + free-text note), rebuilt as clusters are created/merged/split/
+    #    deleted (Cluster Annotations §7). Populated by sync_note_rows.
+    note_rows_box = widgets.VBox([], layout=widgets.Layout(margin="10px 0px", width="100%"))
+
     # ── Controls (hidden until slide is loaded) ──
     controls = widgets.VBox(
-        [zoom_slider, image_row, status_row, complete_output], layout=widgets.Layout(display="none")
+        [zoom_slider, image_row, status_row, note_rows_box, complete_output],
+        layout=widgets.Layout(display="none"),
     )
 
     # ── Output area ──
@@ -240,7 +259,7 @@ def create_viewer_ui():
         return clamp_viewport(viewport, state["slide_w"], state["slide_h"])
 
     def update_status_label():
-        count = len(state["selected_tiles"])
+        count = len(all_selected_tiles(state["cluster_state"]))
         tile_word = "tile" if count == 1 else "tiles"
         status_label.value = f"<b>Selected:</b> {count} {tile_word}"
 
@@ -257,18 +276,21 @@ def create_viewer_ui():
 
         view_img = read_region_at_size(slide, x0, y0, downsample, VIEW_SIZE, VIEW_SIZE)
 
-        # Translucent gray fill for selected tiles, composited under the grid
-        # lines and outline (SPEC §4.3, revised: 50%-opacity wash, not a
-        # solid fill, so tissue stays visible through the tint).
+        # Translucent per-cluster fill, composited under the grid lines and
+        # outline (Cluster Annotations §5-§6: each cluster's tiles are
+        # filled in its own color at 50% opacity, replacing the old shared
+        # gray wash -- outline geometry itself is unchanged).
         fill_overlay = Image.new("RGBA", view_img.size, (0, 0, 0, 0))
         fill_draw = ImageDraw.Draw(fill_overlay)
-        for row, col in state["selected_tiles"]:
-            tile_x, tile_y = tile_to_pixel(row, col, GRID_ORIGIN, TILE_SIZE_LEVEL0)
-            fx0 = round((tile_x - x0) / downsample)
-            fy0 = round((tile_y - y0) / downsample)
-            fx1 = round((tile_x + TILE_SIZE_LEVEL0 - x0) / downsample)
-            fy1 = round((tile_y + TILE_SIZE_LEVEL0 - y0) / downsample)
-            fill_draw.rectangle([fx0, fy0, fx1, fy1], fill=SELECTED_FILL_COLOR + (SELECTED_FILL_ALPHA,))
+        for cluster in state["cluster_state"]["clusters"].values():
+            fill_color = _hex_to_rgb(cluster["color"])
+            for row, col in cluster["tiles"]:
+                tile_x, tile_y = tile_to_pixel(row, col, GRID_ORIGIN, TILE_SIZE_LEVEL0)
+                fx0 = round((tile_x - x0) / downsample)
+                fy0 = round((tile_y - y0) / downsample)
+                fx1 = round((tile_x + TILE_SIZE_LEVEL0 - x0) / downsample)
+                fy1 = round((tile_y + TILE_SIZE_LEVEL0 - y0) / downsample)
+                fill_draw.rectangle([fx0, fy0, fx1, fy1], fill=fill_color + (SELECTED_FILL_ALPHA,))
         view_img = Image.alpha_composite(view_img.convert("RGBA"), fill_overlay).convert("RGB")
 
         draw_view = ImageDraw.Draw(view_img)
@@ -286,7 +308,7 @@ def create_viewer_ui():
         # unselected/outside one are drawn, so adjacent selected tiles merge
         # into one outline instead of a lattice of boxes (SPEC §5.3).
         outline_segments = compute_selection_outlines(
-            state["selected_tiles"], GRID_ORIGIN, TILE_SIZE_LEVEL0
+            all_selected_tiles(state["cluster_state"]), GRID_ORIGIN, TILE_SIZE_LEVEL0
         )
         for (seg_x0, seg_y0), (seg_x1, seg_y1) in outline_segments:
             screen_x0 = round((seg_x0 - x0) / downsample)
@@ -323,17 +345,19 @@ def create_viewer_ui():
 
         thumb_fill_overlay = Image.new("RGBA", state["thumbnail"].size, (0, 0, 0, 0))
         thumb_fill_draw = ImageDraw.Draw(thumb_fill_overlay)
-        for row, col in state["selected_tiles"]:
-            tile_x, tile_y = tile_to_pixel(row, col, GRID_ORIGIN, TILE_SIZE_LEVEL0)
-            tfx0 = tile_x * thumb_scale_x
-            tfy0 = tile_y * thumb_scale_y
-            tfx1 = (tile_x + TILE_SIZE_LEVEL0) * thumb_scale_x
-            tfy1 = (tile_y + TILE_SIZE_LEVEL0) * thumb_scale_y
-            thumb_fill_draw.rectangle([tfx0, tfy0, tfx1, tfy1], fill=SELECTED_FILL_COLOR + (SELECTED_FILL_ALPHA,))
+        for cluster in state["cluster_state"]["clusters"].values():
+            fill_color = _hex_to_rgb(cluster["color"])
+            for row, col in cluster["tiles"]:
+                tile_x, tile_y = tile_to_pixel(row, col, GRID_ORIGIN, TILE_SIZE_LEVEL0)
+                tfx0 = tile_x * thumb_scale_x
+                tfy0 = tile_y * thumb_scale_y
+                tfx1 = (tile_x + TILE_SIZE_LEVEL0) * thumb_scale_x
+                tfy1 = (tile_y + TILE_SIZE_LEVEL0) * thumb_scale_y
+                thumb_fill_draw.rectangle([tfx0, tfy0, tfx1, tfy1], fill=fill_color + (SELECTED_FILL_ALPHA,))
         thumb_copy = Image.alpha_composite(state["thumbnail"].convert("RGBA"), thumb_fill_overlay)
 
         outline_segments = compute_selection_outlines(
-            state["selected_tiles"], GRID_ORIGIN, TILE_SIZE_LEVEL0
+            all_selected_tiles(state["cluster_state"]), GRID_ORIGIN, TILE_SIZE_LEVEL0
         )
         draw = ImageDraw.Draw(thumb_copy)
         for (seg_x0, seg_y0), (seg_x1, seg_y1) in outline_segments:
@@ -364,6 +388,93 @@ def create_viewer_ui():
         horizontal_pan_slider.value = state["center_x"]
         vertical_pan_slider.value = state["slide_h"] - state["center_y"]
         state["syncing_pan_sliders"] = False
+
+    # ──────────────────────────────────────────
+    # Cluster note rows (Cluster Annotations §7)
+    # ──────────────────────────────────────────
+
+    def _make_note_row(cluster_id, cluster):
+        """A [color swatch][note textarea] row for one cluster. Typing writes
+        straight into cluster_state -- there's no separate save step; the
+        text present when Complete is clicked is what gets exported.
+        Clicking the swatch recenters the viewport on that cluster."""
+        swatch = widgets.Button(
+            description="",
+            tooltip="Click to view this cluster",
+            layout=widgets.Layout(
+                width="16px", height="16px", padding="0px", margin="0px 8px 0px 0px", border="1px solid #888"
+            ),
+            style={"button_color": cluster["color"]},
+        )
+
+        def on_swatch_click(b, cluster_id=cluster_id):
+            if state["slide"] is None:
+                return
+            cluster = state["cluster_state"]["clusters"].get(cluster_id)
+            if cluster is None:
+                return
+            center_x, center_y = compute_tiles_centroid(cluster["tiles"], GRID_ORIGIN, TILE_SIZE_LEVEL0)
+            state["center_x"] = center_x
+            state["center_y"] = center_y
+            sync_pan_sliders()
+            render_view()
+
+        swatch.on_click(on_swatch_click)
+
+        textarea = widgets.Textarea(
+            value=cluster["note"],
+            placeholder="Note for this region...",
+            # flex, not a fixed width -- grows to fill the row's remaining
+            # horizontal space next to the fixed-width swatch.
+            layout=widgets.Layout(flex="1 1 auto", height="40px"),
+            continuous_update=True,
+        )
+
+        def on_note_change(change, cluster_id=cluster_id):
+            state["cluster_state"]["clusters"][cluster_id]["note"] = change["new"]
+
+        textarea.observe(on_note_change, names="value")
+        row = widgets.HBox(
+            [swatch, textarea], layout=widgets.Layout(align_items="center", margin="4px 0px", width="100%")
+        )
+        return row, textarea
+
+    def sync_note_rows():
+        """
+        Add a row for every cluster that doesn't have one yet, remove rows
+        for clusters that no longer exist, and refresh the displayed text of
+        every surviving row to match cluster_state.
+
+        That refresh matters for a merge: the winning cluster keeps its
+        existing id/row, but its note changes (joined with the losing
+        clusters' notes) without the pathologist typing anything -- without
+        this, the row would keep showing its stale pre-merge text. It's safe
+        to always push cluster_state's note into the widget because typing
+        already keeps the two in sync live (continuous_update), so they can
+        only differ right after an external change like this; a mouse-driven
+        merge can't happen mid-keystroke in a single browser tab, so this
+        never clobbers an in-progress edit.
+        """
+        clusters = state["cluster_state"]["clusters"]
+        current_ids = set(clusters.keys())
+        tracked_ids = set(state["note_widgets"].keys())
+
+        for cluster_id in tracked_ids - current_ids:
+            removed = state["note_widgets"].pop(cluster_id)
+            removed["textarea"].close()
+            removed["row"].close()
+
+        for cluster_id in current_ids - tracked_ids:
+            row, textarea = _make_note_row(cluster_id, clusters[cluster_id])
+            state["note_widgets"][cluster_id] = {"row": row, "textarea": textarea}
+
+        for cluster_id in current_ids:
+            textarea = state["note_widgets"][cluster_id]["textarea"]
+            current_note = clusters[cluster_id]["note"]
+            if textarea.value != current_note:
+                textarea.value = current_note
+
+        note_rows_box.children = tuple(state["note_widgets"][cid]["row"] for cid in sorted(current_ids))
 
     # ──────────────────────────────────────────
     # Mouse interaction on thumbnail
@@ -443,7 +554,10 @@ def create_viewer_ui():
         if (row, col) == state["last_painted_tile"]:
             return
         state["last_painted_tile"] = (row, col)
-        set_tile(state["selected_tiles"], row, col, state["paint_value"])
+        if state["paint_value"]:
+            select_tile(state["cluster_state"], row, col)
+        else:
+            deselect_tile(state["cluster_state"], row, col)
         # Main viewport only during the drag -- the thumbnail catches up
         # once on mouseup instead of redoing its own selection pass and PNG
         # encode on every tile touched mid-drag.
@@ -457,13 +571,16 @@ def create_viewer_ui():
         if etype == "mousedown":
             row, col = resolve_event_to_tile(event)
             state["is_painting"] = True
-            state["paint_value"] = (row, col) not in state["selected_tiles"]
+            state["paint_value"] = (row, col) not in state["cluster_state"]["tile_to_cluster"]
             state["last_painted_tile"] = None
             paint_tile(row, col)
         elif etype == "mouseup":
             state["is_painting"] = False
             state["last_painted_tile"] = None
             render_thumbnail()
+            # Once per stroke, not per tile -- mirrors the deferred
+            # thumbnail render just above.
+            sync_note_rows()
         elif etype == "mousemove" and state["is_painting"]:
             row, col = resolve_event_to_tile(event)
             paint_tile(row, col)
@@ -477,9 +594,10 @@ def create_viewer_ui():
     def on_reset_click(b):
         if state["slide"] is None:
             return
-        state["selected_tiles"].clear()
+        state["cluster_state"] = create_cluster_state()
         state["last_painted_tile"] = None
         render_view()
+        sync_note_rows()
 
     reset_button.on_click(on_reset_click)
 
@@ -508,10 +626,10 @@ def create_viewer_ui():
                 tool_version=TOOL_VERSION,
                 timestamp=now.isoformat(),
             )
-            tile_records = build_tile_records(
+            cluster_records = build_cluster_records(
                 GRID_ORIGIN,
                 TILE_SIZE_LEVEL0,
-                state["selected_tiles"],
+                state["cluster_state"],
             )
 
             # {slide_filename}_{annotator}_{timestamp}.json, so exports for
@@ -524,9 +642,9 @@ def create_viewer_ui():
 
             ANNOTATIONS_DIR.mkdir(parents=True, exist_ok=True)
             output_path = ANNOTATIONS_DIR / output_filename
-            export_annotations(str(output_path), slide_metadata, tile_records)
+            export_annotations(str(output_path), slide_metadata, cluster_records)
 
-            print(f"Saved {len(tile_records)} selected tile records to {output_path}")
+            print(f"Saved {len(cluster_records)} clusters to {output_path}")
 
     complete_button.on_click(on_complete_click)
 
@@ -576,9 +694,10 @@ def create_viewer_ui():
 
         state["center_x"] = state["slide_w"] // 2
         state["center_y"] = state["slide_h"] // 2
-        state["selected_tiles"] = set()
+        state["cluster_state"] = create_cluster_state()
         state["last_painted_tile"] = None
         sync_pan_sliders()
+        sync_note_rows()
 
         mpp_str = f"{metadata['mpp']:.4f} µm/px" if metadata["mpp"] else "N/A"
         obj_str = f"{metadata['objective']}×" if metadata["objective"] else "N/A"
@@ -683,9 +802,9 @@ def create_viewer_ui():
         #    Quiet on success by design: only failures print, so a routine
         #    resume doesn't clutter the log.
         _commit_slide(candidate_slide, resolved_slide_path, candidate_metadata)
-        for tile in data["tiles"]:
-            state["selected_tiles"].add((tile["row"], tile["col"]))
+        state["cluster_state"] = cluster_state_from_clusters(data["clusters"])
         render_view()
+        sync_note_rows()
 
     def on_load_click(b):
         load_button.disabled = True
