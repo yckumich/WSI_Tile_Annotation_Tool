@@ -145,13 +145,6 @@ def create_viewer_ui():
         format="png",
         layout=widgets.Layout(border="1px solid #ccc", cursor="crosshair", margin="0px"),
     )
-    thumb_label = widgets.HTML(
-        value=(
-            "<i style='color:gray; font-size:12px;'>Click or drag on the thumbnail, "
-            "or use the sliders, to navigate</i>"
-        )
-    )
-
     # Pan sliders alongside the thumbnail -- an alternative to click/drag for
     # precise navigation. Range/size are set to match the slide/thumbnail
     # once a slide is loaded (see _commit_slide). Vertical slider value
@@ -179,7 +172,21 @@ def create_viewer_ui():
         [vertical_pan_slider, thumb_and_hslider],
         layout=widgets.Layout(align_items="flex-start", margin="0px"),
     )
-    thumb_column = widgets.VBox([thumb_row, thumb_label])
+    # ── Cluster notes: one row per currently-existing cluster (color swatch
+    #    + free-text note), rebuilt as clusters are created/merged/split/
+    #    deleted (Cluster Annotations §7). Populated by sync_note_rows.
+    #    Lives under the thumbnail (narrower than the rest of the interface,
+    #    but reuses space that's otherwise empty next to the taller main
+    #    viewport) rather than below the Reset/Complete row.
+    #    Fixed max-height with its own scrollbar -- individual rows/text
+    #    boxes are unchanged, but the list of them scrolls internally once
+    #    it overflows, instead of growing the whole page as clusters
+    #    accumulate.
+    note_rows_box = widgets.VBox(
+        [], layout=widgets.Layout(margin="10px 0px", width="100%", max_height="450px", overflow="auto")
+    )
+
+    thumb_column = widgets.VBox([thumb_row, note_rows_box])
 
     # ── Viewport (square) ──
     view_widget = widgets.Image(
@@ -225,14 +232,9 @@ def create_viewer_ui():
     )
     complete_output = widgets.Output()
 
-    # ── Cluster notes: one row per currently-existing cluster (color swatch
-    #    + free-text note), rebuilt as clusters are created/merged/split/
-    #    deleted (Cluster Annotations §7). Populated by sync_note_rows.
-    note_rows_box = widgets.VBox([], layout=widgets.Layout(margin="10px 0px", width="100%"))
-
     # ── Controls (hidden until slide is loaded) ──
     controls = widgets.VBox(
-        [zoom_slider, image_row, status_row, note_rows_box, complete_output],
+        [zoom_slider, image_row, status_row, complete_output],
         layout=widgets.Layout(display="none"),
     )
 
@@ -435,7 +437,13 @@ def create_viewer_ui():
 
         textarea.observe(on_note_change, names="value")
         row = widgets.HBox(
-            [swatch, textarea], layout=widgets.Layout(align_items="center", margin="4px 0px", width="100%")
+            [swatch, textarea],
+            # flex="0 0 auto" -- without this, note_rows_box (a flex column
+            # with a capped height) shrinks every row to fit instead of
+            # overflowing into a scrollbar, since flex items default to
+            # flex-shrink:1. Pinning each row's own size is what makes the
+            # container actually scroll instead of squeezing rows smaller.
+            layout=widgets.Layout(align_items="center", margin="4px 0px", width="100%", flex="0 0 auto"),
         )
         return row, textarea
 
