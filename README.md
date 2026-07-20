@@ -6,6 +6,8 @@ automatically form a colored **region**, and each region gets its own note box
 for recording the reasoning behind it. On **Complete**, everything is exported
 to a timestamped JSON file for downstream analysis.
 
+ [Watch the walkthrough]
+
 ## Requirements
 
 - Python 3.10 or 3.11
@@ -17,7 +19,7 @@ to a timestamped JSON file for downstream analysis.
 ## 1. Clone the repo
 
 ```bash
-git clone <this-repo-url>
+git clone https://github.com/yckumich/WSI_Tile_Annotation_Tool.git
 cd WSI_Tile_Annotation_Tool
 ```
 
@@ -62,12 +64,3 @@ your `.svs`, enter your name as **Annotator ID**, and click **Load**.
   as you left them.
 
 Full step-by-step instructions are also in the notebook itself.
-
-## Running tests
-
-```bash
-pytest
-```
-
-Covers the tile-grid and region (create/grow/merge/split) logic in `utils/`
-— the parts most likely to silently produce wrong results if broken.
