@@ -32,7 +32,7 @@ echo ""
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/.venv"
 KERNEL_NAME="wsi_tile_annotation"
-NOTEBOOK="viewer_dev.ipynb"
+NOTEBOOK="viewer.ipynb"
 
 cd "$SCRIPT_DIR"
 
