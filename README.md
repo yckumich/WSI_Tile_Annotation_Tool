@@ -6,7 +6,7 @@ automatically form a colored **region**, and each region gets its own note box
 for recording the reasoning behind it. On **Complete**, everything is exported
 to a timestamped JSON file for downstream analysis.
 
- [Watch the walkthrough]
+[Watch the walkthrough](https://www.dropbox.com/scl/fi/tx3n3koxfpp19j9gknwen/vid_tool.mov?rlkey=3qr5mlcuk5znw2jzywd4xzk6q&st=41gkuyi2&dl=0)
 
 ## Requirements
 
